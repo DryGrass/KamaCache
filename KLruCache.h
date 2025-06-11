@@ -21,7 +21,7 @@ private:
     Key key_;
     Value value_;
     size_t accessCount_;  // 访问次数
-    std::shared_ptr<LruNode<Key, Value>> prev_;  
+    std::weak_ptr<LruNode<Key, Value>> prev_;  // 改为weak_ptr打破循环引用
     std::shared_ptr<LruNode<Key, Value>> next_;
 
 public:
@@ -29,8 +29,6 @@ public:
         : key_(key)
         , value_(value)
         , accessCount_(1) 
-        , prev_(nullptr)
-        , next_(nullptr)
     {}
 
     // 提供必要的访问器
@@ -148,8 +146,13 @@ private:
 
     void removeNode(NodePtr node) 
     {
-        node->prev_->next_ = node->next_;
-        node->next_->prev_ = node->prev_;
+        if(!node->prev_.expired() && node->next_) 
+        {
+            auto prev = node->prev_.lock(); // 使用lock()获取shared_ptr
+            prev->next_ = node->next_;
+            node->next_->prev_ = prev;
+            node->next_ = nullptr; // 清空next_指针，彻底断开节点与链表的连接
+        }
     }
 
     // 从尾部插入结点
@@ -157,7 +160,7 @@ private:
     {
         node->next_ = dummyTail_;
         node->prev_ = dummyTail_->prev_;
-        dummyTail_->prev_->next_ = node;
+        dummyTail_->prev_.lock()->next_ = node; // 使用lock()获取shared_ptr
         dummyTail_->prev_ = node;
     }
 
@@ -170,9 +173,9 @@ private:
     }
 
 private:
-    int          capacity_; // 缓存容量
-    NodeMap      nodeMap_; // key -> Node 
-    std::mutex   mutex_;
+    int           capacity_; // 缓存容量
+    NodeMap       nodeMap_; // key -> Node 
+    std::mutex    mutex_;
     NodePtr       dummyHead_; // 虚拟头结点
     NodePtr       dummyTail_;
 };
@@ -188,32 +191,76 @@ public:
         , k_(k)
     {}
 
-    Value get(Key key)
+    Value get(Key key) 
     {
-        // 获取该数据访问次数
-        int historyCount = historyList_->get(key);
-        // 如果访问到数据，则更新历史访问记录节点值count++
-        historyList_->put(key, ++historyCount); 
-        
-        // 从缓存中获取数据，不一定能获取到，因为可能不在缓存中
-        return KLruCache<Key, Value>::get(key);
+        // 首先尝试从主缓存获取数据
+        Value value{};
+        bool inMainCache = KLruCache<Key, Value>::get(key, value);
+
+        // 获取并更新访问历史计数
+        size_t historyCount = historyList_->get(key);
+        historyCount++;
+        historyList_->put(key, historyCount);
+
+        // 如果数据在主缓存中，直接返回
+        if (inMainCache) 
+        {
+            return value;
+        }
+
+        // 如果数据不在主缓存，但访问次数达到了k次
+        if (historyCount >= k_) 
+        {
+            // 检查是否有历史值记录
+            auto it = historyValueMap_.find(key);
+            if (it != historyValueMap_.end()) 
+            {
+                // 有历史值，将其添加到主缓存
+                Value storedValue = it->second;
+                
+                // 从历史记录移除
+                historyList_->remove(key);
+                historyValueMap_.erase(it);
+                
+                // 添加到主缓存
+                KLruCache<Key, Value>::put(key, storedValue);
+                
+                return storedValue;
+            }
+            // 没有历史值记录，无法添加到缓存，返回默认值
+        }
+
+        // 数据不在主缓存且不满足添加条件，返回默认值
+        return value;
     }
 
-    void put(Key key, Value value)
+    void put(Key key, Value value) 
     {
-        // 先判断是否存在于缓存中，如果存在于则直接覆盖，如果不存在则不直接添加到缓存
-        if (KLruCache<Key, Value>::get(key) != "")
-            KLruCache<Key, Value>::put(key, value);
+        // 检查是否已在主缓存
+        Value existingValue{};
+        bool inMainCache = KLruCache<Key, Value>::get(key, existingValue);
         
-        // 如果数据历史访问次数达到上限，则添加入缓存
-        int historyCount = historyList_->get(key);
-        historyList_->put(key, ++historyCount); 
-
-        if (historyCount >= k_)
+        if (inMainCache) 
         {
-            // 移除历史访问记录
+            // 已在主缓存，直接更新
+            KLruCache<Key, Value>::put(key, value);
+            return;
+        }
+        
+        // 获取并更新访问历史
+        size_t historyCount = historyList_->get(key);
+        historyCount++;
+        historyList_->put(key, historyCount);
+        
+        // 保存值到历史记录映射，供后续get操作使用
+        historyValueMap_[key] = value;
+        
+        // 检查是否达到k次访问阈值
+        if (historyCount >= k_) 
+        {
+            // 达到阈值，添加到主缓存
             historyList_->remove(key);
-            // 添加入缓存中
+            historyValueMap_.erase(key);
             KLruCache<Key, Value>::put(key, value);
         }
     }
@@ -221,7 +268,8 @@ public:
 private:
     int                                     k_; // 进入缓存队列的评判标准
     std::unique_ptr<KLruCache<Key, size_t>> historyList_; // 访问数据历史记录(value为访问次数)
-}; 
+    std::unordered_map<Key, Value>          historyValueMap_; // 存储未达到k次访问的数据值
+};
 
 // lru优化：对lru进行分片，提高高并发使用的性能
 template<typename Key, typename Value>
@@ -243,7 +291,7 @@ public:
     {
         // 获取key的hash值，并计算出对应的分片索引
         size_t sliceIndex = Hash(key) % sliceNum_;
-        return lruSliceCaches_[sliceIndex]->put(key, value);
+        lruSliceCaches_[sliceIndex]->put(key, value);
     }
 
     bool get(Key key, Value& value)
