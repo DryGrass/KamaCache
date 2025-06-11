@@ -4,6 +4,7 @@ CMakeFiles/
 CMakeCache.txt
 .cache/
 .vscode/
+.test
 
 # CMake 生成的可执行文件和库
 *.exe
